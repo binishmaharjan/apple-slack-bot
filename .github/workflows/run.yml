@@ -2,8 +2,8 @@ name: Apple News Slack Bot
 
 on:
   schedule:
-    # Runs every hour on the hour (cron syntax)
-    - cron: '0 * * * *'
+    # Runs once daily at 00:00 UTC (09:00 JST)
+    - cron: '0 0 * * *'
   # Allows you to manually trigger it with a button for testing
   workflow_dispatch:
 
