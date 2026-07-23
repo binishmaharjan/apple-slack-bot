@@ -16,6 +16,10 @@ HEADERS = {
 ARTICLE_PATTERN = re.compile(
     r'<a class="article-title" href="(/news/\?id=[^"]+)"><h2>([^<]+)</h2></a>'
 )
+META_TAG_PATTERN = re.compile(
+    r'<meta\s+(?:property|name)="(?P<key>[^"]+)"\s+content="(?P<value>[^"]*)"',
+    re.IGNORECASE,
+)
 
 def load_last_article_id():
     try:
@@ -47,6 +51,37 @@ def fetch_latest_apple_news():
     article_id = path.rsplit("id=", 1)[-1]
     return title.strip(), f"{APPLE_NEWS_BASE}{path}", article_id
 
+def fetch_article_preview(link):
+    response = requests.get(link, headers=HEADERS, timeout=15)
+    if response.status_code != 200:
+        return "", ""
+
+    tags = {
+        match.group("key"): match.group("value")
+        for match in META_TAG_PATTERN.finditer(response.text)
+    }
+
+    description = tags.get("og:description") or tags.get("twitter:description") or ""
+    image_url = tags.get("og:image") or tags.get("twitter:image") or ""
+    return description.strip(), image_url.strip()
+
+def build_slack_payload(title, link, description, image_url):
+    attachment = {
+        "fallback": f"{title} - {link}",
+        "title": title,
+        "title_link": link,
+        "text": description,
+        "color": "#007AFF",
+    }
+
+    if image_url:
+        attachment["image_url"] = image_url
+
+    return {
+        "text": "📢 *Latest Apple Developer News*",
+        "attachments": [attachment],
+    }
+
 def check_apple_news():
     if not WEBHOOK_URL:
         raise ValueError("❌ SLACK_WEBHOOK_URL environment variable is missing or empty!")
@@ -68,11 +103,8 @@ def check_apple_news():
 
     print("Posting to Slack...")
 
-    payload = {
-        "text": f"📢 *Latest Apple Developer News*\n{title}\n{link}",
-        "unfurl_links": True,
-        "unfurl_media": True,
-    }
+    description, image_url = fetch_article_preview(link)
+    payload = build_slack_payload(title, link, description, image_url)
 
     res = requests.post(WEBHOOK_URL, json=payload, timeout=10)
 
