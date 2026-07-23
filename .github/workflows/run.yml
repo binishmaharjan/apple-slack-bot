@@ -1,4 +1,4 @@
-name: Apple News Slack Bot
+name: Dev News Slack Bot
 
 on:
   schedule:
@@ -14,11 +14,11 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Restore last article state
+      - name: Restore feed state
         uses: actions/cache/restore@v4
         with:
-          path: state/last_article_id.txt
-          key: apple-news-last-article
+          path: state/
+          key: dev-news-bot-state-v1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -33,9 +33,9 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: python main.py
 
-      - name: Save last article state
-        if: hashFiles('state/last_article_id.txt') != ''
+      - name: Save feed state
+        if: hashFiles('state/*.txt') != ''
         uses: actions/cache/save@v4
         with:
-          path: state/last_article_id.txt
-          key: apple-news-last-article
+          path: state/
+          key: dev-news-bot-state-v1
