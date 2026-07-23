@@ -69,7 +69,9 @@ def check_apple_news():
     print("Posting to Slack...")
 
     payload = {
-        "text": f"📢 *Latest Apple Developer News*\n*<{link}|{title}>*"
+        "text": f"📢 *Latest Apple Developer News*\n{title}\n{link}",
+        "unfurl_links": True,
+        "unfurl_media": True,
     }
 
     res = requests.post(WEBHOOK_URL, json=payload, timeout=10)
