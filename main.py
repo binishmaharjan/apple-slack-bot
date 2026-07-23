@@ -1,37 +1,39 @@
 import os
+import requests
 import feedparser
-from curl_cffi import requests
 
 WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
-APPLE_RSS = "https://developer.apple.com/news/rss/news.rss"
+
+# Fetch Apple Developer News via Google News RSS mirror (bypasses Akamai IP block)
+GOOGLE_NEWS_APPLE_RSS = "https://news.google.com/rss/search?q=site:developer.apple.com/news&hl=en-US&gl=US&ceid=US:en"
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+}
 
 def check_apple_news():
     if not WEBHOOK_URL:
         raise ValueError("❌ SLACK_WEBHOOK_URL environment variable is missing or empty!")
 
-    print("Fetching Apple RSS feed using TLS browser impersonation...")
+    print("Fetching Apple Developer News via Google News RSS mirror...")
     
-    # Impersonate a real Chrome browser's TLS signature and HTTP/2 framing
-    response = requests.get(
-        APPLE_RSS,
-        impersonate="chrome",
-        timeout=15
-    )
-    
+    response = requests.get(GOOGLE_NEWS_APPLE_RSS, headers=HEADERS, timeout=15)
     print(f"HTTP Status Code: {response.status_code}")
 
     if response.status_code != 200:
         raise RuntimeError(f"❌ Failed to fetch feed. Server returned HTTP status {response.status_code}")
 
-    # Parse the returned XML content
+    # Parse XML feed content
     feed = feedparser.parse(response.content)
     print(f"Found {len(feed.entries)} feed entries.")
 
     if not feed.entries:
-        raise RuntimeError("❌ RSS Feed returned 0 entries. Parsing failed or payload empty.")
+        raise RuntimeError("❌ Feed returned 0 entries.")
 
     latest = feed.entries[0]
     title = latest.title.strip()
+    
+    # Extract the original article link if available, otherwise fallback to the feed link
     link = latest.link.strip()
 
     print(f"Latest Article Title: '{title}'")
@@ -41,7 +43,6 @@ def check_apple_news():
         "text": f"📢 *Latest Apple Developer News*\n*<{link}|{title}>*"
     }
 
-    # Standard post to Slack Webhook
     res = requests.post(WEBHOOK_URL, json=payload, timeout=10)
 
     if res.status_code != 200:
