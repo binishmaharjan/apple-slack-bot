@@ -1,0 +1,28 @@
+name: Apple News Slack Bot
+
+on:
+  schedule:
+    # Runs every hour on the hour (cron syntax)
+    - cron: '0 * * * *'
+  # Allows you to manually trigger it with a button for testing
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Script
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python main.py
