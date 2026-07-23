@@ -14,6 +14,12 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      - name: Restore last article state
+        uses: actions/cache/restore@v4
+        with:
+          path: state/last_article_id.txt
+          key: apple-news-last-article
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -26,3 +32,10 @@ jobs:
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: python main.py
+
+      - name: Save last article state
+        if: hashFiles('state/last_article_id.txt') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: state/last_article_id.txt
+          key: apple-news-last-article
