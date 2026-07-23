@@ -1,31 +1,34 @@
 import os
-import requests
 import feedparser
+from curl_cffi import requests
 
 WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
-
-# Raw proxy wrapper to bypass Akamai / Datacenter IP blocks
 APPLE_RSS = "https://developer.apple.com/news/rss/news.rss"
-PROXY_FEED_URL = f"https://api.allorigins.win/raw?url={APPLE_RSS}"
 
 def check_apple_news():
     if not WEBHOOK_URL:
         raise ValueError("❌ SLACK_WEBHOOK_URL environment variable is missing or empty!")
 
-    print("Fetching Apple RSS feed via AllOrigins raw proxy...")
+    print("Fetching Apple RSS feed using TLS browser impersonation...")
     
-    response = requests.get(PROXY_FEED_URL, timeout=15)
+    # Impersonate a real Chrome browser's TLS signature and HTTP/2 framing
+    response = requests.get(
+        APPLE_RSS,
+        impersonate="chrome",
+        timeout=15
+    )
+    
     print(f"HTTP Status Code: {response.status_code}")
 
     if response.status_code != 200:
-        raise RuntimeError(f"❌ Proxy request failed with HTTP status {response.status_code}")
+        raise RuntimeError(f"❌ Failed to fetch feed. Server returned HTTP status {response.status_code}")
 
     # Parse the returned XML content
     feed = feedparser.parse(response.content)
     print(f"Found {len(feed.entries)} feed entries.")
 
     if not feed.entries:
-        raise RuntimeError("❌ RSS Feed returned 0 entries. Proxy payload was empty or invalid XML.")
+        raise RuntimeError("❌ RSS Feed returned 0 entries. Parsing failed or payload empty.")
 
     latest = feed.entries[0]
     title = latest.title.strip()
@@ -38,6 +41,7 @@ def check_apple_news():
         "text": f"📢 *Latest Apple Developer News*\n*<{link}|{title}>*"
     }
 
+    # Standard post to Slack Webhook
     res = requests.post(WEBHOOK_URL, json=payload, timeout=10)
 
     if res.status_code != 200:
