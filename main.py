@@ -1,7 +1,9 @@
 import html
+import json
 import os
 import re
 import sys
+import time
 
 import feedparser
 import requests
@@ -9,6 +11,8 @@ import requests
 WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
 STATE_DIR = os.path.join(os.path.dirname(__file__), "state")
 LEGACY_APPLE_STATE_FILE = os.path.join(STATE_DIR, "last_article_id.txt")
+FEED_ENTRY_LIMIT = 30
+SLACK_POST_DELAY_SECONDS = 1
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -65,28 +69,75 @@ SOURCES = [
 ]
 
 
-def state_file(source_id):
+def state_json_file(source_id):
+    return os.path.join(STATE_DIR, f"{source_id}.json")
+
+
+def legacy_state_file(source_id):
     return os.path.join(STATE_DIR, f"{source_id}.txt")
 
 
-def load_last_entry_id(source_id):
-    path = state_file(source_id)
+def normalize_entry_id(raw_id):
+    if not raw_id:
+        return ""
+
+    entry_id = raw_id.strip()
+    if "id=" in entry_id:
+        entry_id = entry_id.rsplit("id=", 1)[-1].split("&", 1)[0]
+    if entry_id.startswith("http"):
+        entry_id = entry_id.rstrip("/")
+
+    return entry_id
+
+
+def load_legacy_txt_id(source_id):
+    for path in (legacy_state_file(source_id),):
+        try:
+            with open(path, encoding="utf-8") as f:
+                entry_id = normalize_entry_id(f.read())
+                if entry_id:
+                    return entry_id
+        except FileNotFoundError:
+            continue
+
+    if source_id == "apple" and os.path.isfile(LEGACY_APPLE_STATE_FILE):
+        with open(LEGACY_APPLE_STATE_FILE, encoding="utf-8") as f:
+            entry_id = normalize_entry_id(f.read())
+            if entry_id:
+                return entry_id
+
+    return None
+
+
+def load_state(source_id):
+    json_path = state_json_file(source_id)
     try:
-        with open(path, encoding="utf-8") as f:
-            entry_id = f.read().strip()
-            return entry_id or None
+        with open(json_path, encoding="utf-8") as f:
+            data = json.load(f)
+        seen_ids = {normalize_entry_id(entry_id) for entry_id in data.get("seen_ids", [])}
+        seen_ids.discard("")
+        return seen_ids, bool(data.get("bootstrapped", False)), False
     except FileNotFoundError:
-        if source_id == "apple" and os.path.isfile(LEGACY_APPLE_STATE_FILE):
-            with open(LEGACY_APPLE_STATE_FILE, encoding="utf-8") as f:
-                entry_id = f.read().strip()
-                return entry_id or None
-        return None
+        pass
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid state file '{json_path}': {exc}") from exc
+
+    legacy_id = load_legacy_txt_id(source_id)
+    if legacy_id:
+        return {legacy_id}, False, True
+
+    return set(), False, False
 
 
-def save_last_entry_id(source_id, entry_id):
+def save_state(source_id, seen_ids, bootstrapped):
     os.makedirs(STATE_DIR, exist_ok=True)
-    with open(state_file(source_id), "w", encoding="utf-8") as f:
-        f.write(entry_id)
+    payload = {
+        "seen_ids": sorted(seen_ids),
+        "bootstrapped": bootstrapped,
+    }
+    with open(state_json_file(source_id), "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
 
 
 def strip_html(text):
@@ -96,7 +147,7 @@ def strip_html(text):
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
-def fetch_latest_apple_news(url):
+def fetch_apple_news_entries(url):
     print(f"Fetching {url}...")
 
     response = requests.get(url, headers=HEADERS, timeout=15)
@@ -105,14 +156,28 @@ def fetch_latest_apple_news(url):
     if response.status_code != 200:
         raise RuntimeError(f"Server returned HTTP status {response.status_code}")
 
-    match = ARTICLE_PATTERN.search(response.text)
-    if not match:
+    entries = []
+    for match in ARTICLE_PATTERN.finditer(response.text):
+        path, title = match.groups()
+        entry_id = normalize_entry_id(path.rsplit("id=", 1)[-1])
+        link = f"{APPLE_NEWS_BASE}{path}"
+        if not entry_id or not title.strip():
+            continue
+        entries.append(
+            {
+                "id": entry_id,
+                "title": title.strip(),
+                "link": link,
+                "description": "",
+                "image_url": "",
+            }
+        )
+
+    if not entries:
         raise RuntimeError("Could not find any news articles on the page.")
 
-    path, title = match.groups()
-    entry_id = path.rsplit("id=", 1)[-1]
-    link = f"{APPLE_NEWS_BASE}{path}"
-    return title.strip(), link, entry_id, "", ""
+    print(f"Found {len(entries)} article(s) on the page.")
+    return entries
 
 
 def fetch_article_preview(link):
@@ -138,7 +203,7 @@ def get_feed_image(entry):
     return ""
 
 
-def fetch_latest_feed_entry(url):
+def fetch_feed_entries(url, limit=FEED_ENTRY_LIMIT):
     print(f"Fetching feed from {url}...")
 
     response = requests.get(url, headers=HEADERS, timeout=15)
@@ -152,42 +217,61 @@ def fetch_latest_feed_entry(url):
         detail = parsed.bozo_exception if parsed.bozo else "Feed contains no entries."
         raise RuntimeError(f"Could not parse feed: {detail}")
 
-    entry = parsed.entries[0]
-    title = strip_html(entry.get("title", ""))
-    link = entry.get("link", "")
-    entry_id = entry.get("id") or link
-    description = strip_html(entry.get("summary") or entry.get("description", ""))
-    image_url = get_feed_image(entry)
+    entries = []
+    for entry in parsed.entries[:limit]:
+        title = strip_html(entry.get("title", ""))
+        link = (entry.get("link") or "").strip()
+        entry_id = normalize_entry_id(entry.get("id") or link)
+        description = strip_html(entry.get("summary") or entry.get("description", ""))
+        image_url = get_feed_image(entry)
 
-    if not title or not link or not entry_id:
-        raise RuntimeError("Latest feed entry is missing title, link, or id.")
+        if not title or not link or not entry_id:
+            continue
 
-    return title, link, entry_id, description, image_url
+        entries.append(
+            {
+                "id": entry_id,
+                "title": title,
+                "link": link,
+                "description": description,
+                "image_url": image_url,
+            }
+        )
+
+    if not entries:
+        raise RuntimeError("Feed entries are missing title, link, or id.")
+
+    print(f"Found {len(entries)} feed entry(ies).")
+    return entries
 
 
-def fetch_latest_entry(source):
+def fetch_entries(source):
     if source["type"] == "html":
-        title, link, entry_id, description, image_url = fetch_latest_apple_news(source["url"])
-        if not description:
-            description, preview_image = fetch_article_preview(link)
-            if preview_image:
-                image_url = preview_image
-        return title, link, entry_id, description, image_url
-
-    return fetch_latest_feed_entry(source["url"])
+        return fetch_apple_news_entries(source["url"])
+    return fetch_feed_entries(source["url"])
 
 
-def build_slack_payload(source, title, link, description, image_url):
+def enrich_entry_preview(entry):
+    if entry.get("description"):
+        return
+
+    description, image_url = fetch_article_preview(entry["link"])
+    entry["description"] = description
+    if image_url:
+        entry["image_url"] = image_url
+
+
+def build_slack_payload(source, entry):
     attachment = {
-        "fallback": f"{title} - {link}",
-        "title": title,
-        "title_link": link,
-        "text": description,
+        "fallback": f"{entry['title']} - {entry['link']}",
+        "title": entry["title"],
+        "title_link": entry["link"],
+        "text": entry.get("description", ""),
         "color": source["color"],
     }
 
-    if image_url:
-        attachment["image_url"] = image_url
+    if entry.get("image_url"):
+        attachment["image_url"] = entry["image_url"]
 
     return {
         "text": f"📢 *Latest {source['label']}*",
@@ -206,27 +290,64 @@ def post_to_slack(payload):
 def check_source(source):
     print(f"\n--- {source['label']} ---")
 
-    title, link, entry_id, description, image_url = fetch_latest_entry(source)
-    last_id = load_last_entry_id(source["id"])
+    entries = fetch_entries(source)
+    seen_ids, bootstrapped, legacy_migration = load_state(source["id"])
+    current_ids = {entry["id"] for entry in entries}
 
-    print(f"Latest entry ID: '{entry_id}'")
-    print(f"Latest entry title: '{title}'")
+    print(f"Seen IDs: {len(seen_ids)} | Current window: {len(current_ids)}")
 
-    if last_id == entry_id:
-        print("No new entries since last run. Skipping Slack post.")
-        return False
+    if legacy_migration:
+        save_state(source["id"], current_ids, bootstrapped=True)
+        print(
+            f"Legacy migration: marked {len(current_ids)} current ID(s) as seen. "
+            "No posts during migration."
+        )
+        return 0
 
-    if last_id:
-        print(f"New entry detected (previous ID: '{last_id}').")
-    else:
-        print("First run with no saved state. Posting latest entry.")
+    if not bootstrapped:
+        save_state(source["id"], current_ids, bootstrapped=True)
+        print(
+            f"Bootstrap complete: marked {len(current_ids)} ID(s) as seen. "
+            "No posts on first run."
+        )
+        return 0
 
-    print("Posting to Slack...")
-    payload = build_slack_payload(source, title, link, description, image_url)
-    post_to_slack(payload)
-    save_last_entry_id(source["id"], entry_id)
-    print("Successfully posted to Slack!")
-    return True
+    new_entries = [entry for entry in entries if entry["id"] not in seen_ids]
+    new_entries.reverse()
+
+    if not new_entries:
+        pruned_ids = seen_ids & current_ids
+        if pruned_ids != seen_ids:
+            removed = len(seen_ids) - len(pruned_ids)
+            save_state(source["id"], pruned_ids, bootstrapped=True)
+            print(f"No new entries. Pruned {removed} obsolete ID(s).")
+        else:
+            print("No new entries since last run.")
+        return 0
+
+    print(f"Found {len(new_entries)} new entr{'y' if len(new_entries) == 1 else 'ies'} to post.")
+    posted = 0
+
+    for index, entry in enumerate(new_entries):
+        print(f"Posting ({index + 1}/{len(new_entries)}): '{entry['title']}'")
+
+        if source["type"] == "html":
+            enrich_entry_preview(entry)
+
+        payload = build_slack_payload(source, entry)
+        post_to_slack(payload)
+
+        seen_ids.add(entry["id"])
+        seen_ids &= current_ids
+        save_state(source["id"], seen_ids, bootstrapped=True)
+        posted += 1
+        print("Successfully posted to Slack!")
+
+        if index < len(new_entries) - 1:
+            time.sleep(SLACK_POST_DELAY_SECONDS)
+
+    print(f"Posted {posted} update(s) for {source['label']}.")
+    return posted
 
 
 def main():
@@ -238,14 +359,13 @@ def main():
 
     for source in SOURCES:
         try:
-            if check_source(source):
-                posted += 1
+            posted += check_source(source)
         except Exception as exc:
             message = f"{source['label']}: {exc}"
             print(f"ERROR: {message}")
             errors.append(message)
 
-    print(f"\nDone. Posted {posted} update(s).")
+    print(f"\nDone. Posted {posted} update(s) total.")
 
     if errors:
         print("\nFailures:")

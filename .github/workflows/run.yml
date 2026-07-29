@@ -16,9 +16,12 @@ jobs:
 
       - name: Restore feed state
         uses: actions/cache/restore@v4
+        id: feed-state-cache
         with:
           path: state/
-          key: dev-news-bot-state-v1
+          key: feed-state-v2-${{ github.run_id }}
+          restore-keys: |
+            feed-state-v2-
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -34,8 +37,8 @@ jobs:
         run: python main.py
 
       - name: Save feed state
-        if: hashFiles('state/*.txt') != ''
+        if: ${{ !cancelled() }}
         uses: actions/cache/save@v4
         with:
           path: state/
-          key: dev-news-bot-state-v1
+          key: feed-state-v2-${{ github.run_id }}
