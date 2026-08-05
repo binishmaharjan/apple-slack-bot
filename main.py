@@ -11,8 +11,9 @@ import requests
 WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
 STATE_DIR = os.path.join(os.path.dirname(__file__), "state")
 LEGACY_APPLE_STATE_FILE = os.path.join(STATE_DIR, "last_article_id.txt")
-FEED_ENTRY_LIMIT = 30
+FEED_ENTRY_LIMIT = 100
 SLACK_POST_DELAY_SECONDS = 1
+STATE_VERSION = 2
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -116,7 +117,8 @@ def load_state(source_id):
             data = json.load(f)
         seen_ids = {normalize_entry_id(entry_id) for entry_id in data.get("seen_ids", [])}
         seen_ids.discard("")
-        return seen_ids, bool(data.get("bootstrapped", False)), False
+        state_version = int(data.get("version", 1))
+        return seen_ids, bool(data.get("bootstrapped", False)), False, state_version
     except FileNotFoundError:
         pass
     except json.JSONDecodeError as exc:
@@ -124,14 +126,15 @@ def load_state(source_id):
 
     legacy_id = load_legacy_txt_id(source_id)
     if legacy_id:
-        return {legacy_id}, False, True
+        return {legacy_id}, False, True, 1
 
-    return set(), False, False
+    return set(), False, False, 1
 
 
-def save_state(source_id, seen_ids, bootstrapped):
+def save_state(source_id, seen_ids, bootstrapped, version=STATE_VERSION):
     os.makedirs(STATE_DIR, exist_ok=True)
     payload = {
+        "version": version,
         "seen_ids": sorted(seen_ids),
         "bootstrapped": bootstrapped,
     }
@@ -291,10 +294,10 @@ def check_source(source):
     print(f"\n--- {source['label']} ---")
 
     entries = fetch_entries(source)
-    seen_ids, bootstrapped, legacy_migration = load_state(source["id"])
+    seen_ids, bootstrapped, legacy_migration, state_version = load_state(source["id"])
     current_ids = {entry["id"] for entry in entries}
 
-    print(f"Seen IDs: {len(seen_ids)} | Current window: {len(current_ids)}")
+    print(f"Seen IDs: {len(seen_ids)} | Fetched: {len(current_ids)}")
 
     if legacy_migration:
         save_state(source["id"], current_ids, bootstrapped=True)
@@ -312,17 +315,21 @@ def check_source(source):
         )
         return 0
 
+    if state_version < STATE_VERSION:
+        added = len(current_ids - seen_ids)
+        seen_ids |= current_ids
+        save_state(source["id"], seen_ids, bootstrapped=True)
+        print(
+            f"State v{STATE_VERSION} migration: merged {added} ID(s) into seen set. "
+            "No posts during migration."
+        )
+        return 0
+
     new_entries = [entry for entry in entries if entry["id"] not in seen_ids]
     new_entries.reverse()
 
     if not new_entries:
-        pruned_ids = seen_ids & current_ids
-        if pruned_ids != seen_ids:
-            removed = len(seen_ids) - len(pruned_ids)
-            save_state(source["id"], pruned_ids, bootstrapped=True)
-            print(f"No new entries. Pruned {removed} obsolete ID(s).")
-        else:
-            print("No new entries since last run.")
+        print("No new entries since last run.")
         return 0
 
     print(f"Found {len(new_entries)} new entr{'y' if len(new_entries) == 1 else 'ies'} to post.")
@@ -338,7 +345,6 @@ def check_source(source):
         post_to_slack(payload)
 
         seen_ids.add(entry["id"])
-        seen_ids &= current_ids
         save_state(source["id"], seen_ids, bootstrapped=True)
         posted += 1
         print("Successfully posted to Slack!")
